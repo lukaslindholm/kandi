@@ -1,3 +1,4 @@
+#TODO kolla upp hur lönar det sig att optimera bänkspelarna
 using DataFrames, CSV
 using JuMP, Gurobi
 
@@ -64,19 +65,154 @@ for gw in 1:38
     
     # Kontrollera om en lösning hittades
     if termination_status(model) == MOI.OPTIMAL
-        # Beräkna total förväntad poäng och total FAKTISK poäng för utvärderingen
         total_xp = objective_value(model)
         
-        # Plocka ut det optimerade laget
-        team_selected = []
+        println("\n==================================================")
+        println("OPTIMALT LAG FÖR GAMEWEEK $gw")
+        println("Total förväntad poäng (xP): ", round(total_xp, digits=2))
+        println("--------------------------------------------------")
+        println("STARTELVA:")
+        
+        # Loopa igenom och skriv ut startelvan
         for i in 1:n
             if value(s[i]) > 0.5
-                push!(team_selected, df_gw.name[i])
+                # Kolla om spelaren är kapten
+                role = value(c[i]) > 0.5 ? "(KAPTEN)" : ""
+                
+                name = df_gw.name[i]
+                pos = df_gw.position[i]
+                
+                # Vaastavs pris är t.ex. 100 för £10.0m, så vi delar med 10
+                price = df_gw.now_cost[i] / 10.0 
+                xp = round(df_gw.expected_points[i], digits=2)
+                
+                # rpad används för att skapa snygga kolumner i terminalen
+                println(rpad(name, 25), rpad(pos, 5), rpad("£$price", 7), rpad("$(xp) xP", 8), role)
             end
         end
         
+        println("--------------------------------------------------")
+        println("BÄNK:")
+        
+        # Loopa igenom och skriv ut bänken
+        for i in 1:n
+            if value(b[i]) > 0.5
+                name = df_gw.name[i]
+                pos = df_gw.position[i]
+                price = df_gw.now_cost[i] / 10.0
+                xp = round(df_gw.expected_points[i], digits=2)
+                
+                println(rpad(name, 25), rpad(pos, 5), rpad("£$price", 7), rpad("$(xp) xP", 8))
+            end
+        end
+        println("==================================================\n")
+        
         push!(results, (GW = gw, ExpectedPoints = total_xp))
-        println("GW $gw löst! Total xP: ", round(total_xp, digits=2))
+        # --------------------------------------------------
+        # SIMULERING AV FPL AUTO-SUBS OCH FAKTISKA POÄNG
+        # --------------------------------------------------
+        
+        # 1. Identifiera spelarnas index i DataFramen
+        starters_idx = Int[]
+        bench_idx = Int[]
+        captain_idx = 0
+        
+        for i in 1:n
+            if value(s[i]) > 0.5
+                push!(starters_idx, i)
+                if value(c[i]) > 0.5
+                    captain_idx = i
+                end
+            elseif value(b[i]) > 0.5
+                push!(bench_idx, i)
+            end
+        end
+        
+        # 2. Sortera bänken i rätt ordning (störst xP först)
+        bench_gk = filter(i -> df_gw.position[i] == "GK", bench_idx)
+        bench_outfield = filter(i -> df_gw.position[i] != "GK", bench_idx)
+        sort!(bench_outfield, by = i -> df_gw.expected_points[i], rev=true)
+        
+        # 3. Genomför auto-subs
+        # Målvakt
+        gk_idx_in_array = findfirst(i -> df_gw.position[i] == "GK", starters_idx)
+        gk_in_df = starters_idx[gk_idx_in_array]
+        
+        if df_gw.minutes[gk_in_df] == 0 && !isempty(bench_gk)
+            bgk = bench_gk[1]
+            if df_gw.minutes[bgk] > 0
+                starters_idx[gk_idx_in_array] = bgk
+                println("-> BYTE: ", df_gw.name[bgk], " (GK) in för ", df_gw.name[gk_in_df])
+            end
+        end
+        
+        # Utespelare (Håll koll på formationen så vi inte får t.ex. 2 backar)
+        formation = Dict(
+            "DEF" => sum(df_gw.position[i] == "DEF" for i in starters_idx),
+            "MID" => sum(df_gw.position[i] == "MID" for i in starters_idx),
+            "FWD" => sum(df_gw.position[i] == "FWD" for i in starters_idx)
+        )
+        
+        for (s_i, p_idx) in enumerate(starters_idx)
+            if df_gw.position[p_idx] != "GK" && df_gw.minutes[p_idx] == 0
+                # Spelaren spelade 0 minuter, sök efter bästa möjliga ersättare
+                for (b_i, sub_idx) in enumerate(bench_outfield)
+                    if sub_idx == -1 
+                        continue # Denna spelare har redan bytts in
+                    end
+                    
+                    if df_gw.minutes[sub_idx] > 0
+                        pos_out = df_gw.position[p_idx]
+                        pos_in = df_gw.position[sub_idx]
+                        
+                        # Kontrollera att bytet inte bryter mot minimum-kraven
+                        if pos_out != pos_in
+                            if pos_out == "DEF" && formation["DEF"] <= 3
+                                continue # Kan inte ta ut en back, vi måste ha minst 3
+                            end
+                            if pos_out == "FWD" && formation["FWD"] <= 1
+                                continue # Kan inte ta ut en anfallare, vi måste ha minst 1
+                            end
+                            # Uppdatera formationen om bytet godkänns
+                            formation[pos_out] -= 1
+                            formation[pos_in] += 1
+                        end
+                        
+                        # Gör bytet!
+                        starters_idx[s_i] = sub_idx
+                        bench_outfield[b_i] = -1 # Markera bänkspelaren som använd
+                        println("-> BYTE: ", df_gw.name[sub_idx], " in för ", df_gw.name[p_idx])
+                        break
+                    end
+                end
+            end
+        end
+        
+        # 4. Hantera Vicekapten
+        # Om originalkaptenen har 0 minuter, flyttas bindeln
+        if df_gw.minutes[captain_idx] == 0
+            # Hitta de spelare i den nya startelvan som faktiskt har spelat
+            played_starters = filter(i -> df_gw.minutes[i] > 0, starters_idx)
+            if !isempty(played_starters)
+                # Vi ger bindeln till den som hade högst xP (bland de som spelade)
+                captain_idx = argmax(i -> df_gw.expected_points[i], played_starters)
+                println("-> KAPTENSBYTE (Vice): ", df_gw.name[captain_idx], " tar över bindeln.")
+            end
+        end
+        
+        # 5. Räkna ut faktiska poäng
+        actual_points = 0
+        for i in starters_idx
+            pts = df_gw.total_points[i]
+            actual_points += pts
+            if i == captain_idx
+                actual_points += pts # Dubbla poäng för kaptenen
+            end
+        end
+        
+        println("--------------------------------------------------")
+        println("FAKTISKA POÄNG (inkl. byten/kapten): ", actual_points)
+        println("==================================================\n")
     else
         println("Kunde inte hitta en optimal lösning för GW $gw")
     end

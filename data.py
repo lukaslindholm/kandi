@@ -23,6 +23,14 @@ for gw in range(1, antal_gws + 1):
     if df_gw_vaastav.empty:
         print(f"  Info: Ingen data hittades för GW {gw} i Vaastavs fil ännu. Hoppar över.")
         continue
+
+    # NYTT STEG: Hantera Double Gameweeks (DGW)
+    # Om en spelare har flera rader i samma GW, slår vi ihop dem till en rad.
+    df_gw_vaastav = df_gw_vaastav.groupby(['element', 'name', 'position', 'team']).agg({
+        'value': 'first',          # Vi tar priset spelaren hade i den första matchen
+        'total_points': 'sum',     # Vi summerar poängen från båda matcherna!
+        'minutes': 'sum'         # Summera minuterna spelade
+    }).reset_index()
     
     # URL till Sertalps projiceringar
     sertalp_url = f"https://raw.githubusercontent.com/sertalpbilal/fpl_optimized/engine/src/static/projection/{säsong}/gw{gw}.csv"
@@ -58,7 +66,7 @@ for gw in range(1, antal_gws + 1):
             
             # (Valfritt) Välj ut de kolumner som Julia faktiskt behöver, så datan blir lättläst
             kolumner_att_spara = [
-                'element', 'name', 'position', 'team', 'value', 'expected_points', 'total_points'
+                'element', 'name', 'position', 'team', 'value', 'expected_points', 'total_points', 'minutes'
             ]
             
             # Säkerställ att alla valda kolumner existerar i vår nya df
